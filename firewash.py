@@ -227,6 +227,26 @@ class ConfigSanitizer:
             return self._sanitize_email(m.group(0))
         return re.sub(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', replace_email, line)
 
+    def _sanitize_iface(self, name):
+        """Map an interface nameif, preserving standard names."""
+        lower = name.lower()
+        if lower in {n.lower() for n in self.preserve_iface}:
+            return name
+        if name in self.iface_map:
+            return self.iface_map[name]
+        replacement = f"iface{self.iface_counter}"
+        self.iface_map[name] = replacement
+        self.iface_counter += 1
+        return replacement
+
+    def _sanitize_nat_ifaces(self, line):
+        """Sanitize interface names inside nat (iface1,iface2) patterns."""
+        def replace_nat_ifaces(m):
+            iface1 = self._sanitize_iface(m.group(1))
+            iface2 = self._sanitize_iface(m.group(2))
+            return f"({iface1},{iface2})"
+        return re.sub(r'\((\S+?),(\S+?)\)', replace_nat_ifaces, line)
+
     def sanitize_ip_in_line(self, line):
         """Replace all IPv4 addresses in a line."""
         # IPv4 with CIDR
@@ -337,6 +357,12 @@ class ConfigSanitizer:
         if m:
             name = self._map_name(m.group(2), self.objgrp_map, "OBJGRP-", "objgrp_counter")
             return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- ACL remark lines ---
+        m = re.match(r'^(access-list\s+)(\S+)(\s+remark\s+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.acl_map, "ACL-", "acl_counter")
+            return f"{m.group(1)}{name}{m.group(3)}REDACTED_REMARK\n"
 
         # --- ACL names ---
         m = re.match(r'^(access-list\s+)(\S+)(\s+.*)', line)
@@ -651,17 +677,38 @@ class ConfigSanitizer:
             ip = self._get_replacement_ip(m.group(2))
             return f"{m.group(1)}{ip}{m.group(3)}\n"
 
-        # --- route entries ---
-        m = re.match(r'^(route\s+\S+\s+)(.*)', line)
+        # --- route entries (route <interface> <network> <mask> <gateway>) ---
+        m = re.match(r'^(route\s+)(\S+)(\s+.*)', line)
         if m:
-            rest = self.sanitize_ip_in_line(m.group(2))
-            return f"{m.group(1)}{rest}\n"
+            iface = self._sanitize_iface(m.group(2))
+            rest = self.sanitize_ip_in_line(m.group(3))
+            return f"{m.group(1)}{iface}{rest}\n"
 
-        # --- nat entries ---
+        # --- no monitor-interface ---
+        m = re.match(r'^(no\s+monitor-interface\s+)(\S+)(.*)', line)
+        if m:
+            iface = self._sanitize_iface(m.group(2))
+            return f"{m.group(1)}{iface}{m.group(3)}\n"
+
+        # --- monitor-interface ---
+        m = re.match(r'^(monitor-interface\s+)(\S+)(.*)', line)
+        if m:
+            iface = self._sanitize_iface(m.group(2))
+            return f"{m.group(1)}{iface}{m.group(3)}\n"
+
+        # --- nat entries (top-level and indented inside objects) ---
         if stripped.startswith('nat ') or stripped.startswith('nat('):
+            line = self._sanitize_nat_ifaces(line)
             line = self.sanitize_ip_in_line(line)
             line = self._replace_object_refs(line)
+            line = self._replace_bare_object_refs(line)
             return line
+
+        # --- group-policy address-pools value ---
+        m = re.match(r'^(\s*address-pools\s+value\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.pool_map, "POOL-", "pool_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
 
         # --- Object/object-group references inside lines ---
         line = self._replace_object_refs(line)
@@ -694,6 +741,20 @@ class ConfigSanitizer:
 
         line = re.sub(r'(?<![-\w])(object\s+)(\S+)(?!\s+(?:network|service))', replace_obj_ref, line)
 
+        return line
+
+    def _replace_bare_object_refs(self, line):
+        """Replace bare object/object-group name references (without keyword prefix).
+        Used for NAT lines where names appear without 'object' or 'object-group' prefix."""
+        # Build combined lookup of all known object and object-group names
+        # Sort by length descending to match longer names first
+        all_names = {}
+        all_names.update(self.object_map)
+        all_names.update(self.objgrp_map)
+        all_names.update(self.pool_map)
+        for orig in sorted(all_names.keys(), key=len, reverse=True):
+            # Word boundary replacement to avoid partial matches
+            line = re.sub(r'(?<!\S)' + re.escape(orig) + r'(?!\S)', all_names[orig], line)
         return line
 
     def sanitize(self, config_text):
@@ -762,6 +823,8 @@ class ConfigSanitizer:
             report["fqdns"] = dict(self.fqdn_map)
         if self.email_map:
             report["emails"] = dict(self.email_map)
+        if self.iface_map:
+            report["interfaces"] = dict(self.iface_map)
         return report
 
 
@@ -817,6 +880,7 @@ def main():
     print(f"    LDAP attr maps:          {len(sanitizer.ldap_attrmap_map)}")
     print(f"    FQDNs replaced:          {len(sanitizer.fqdn_map)}")
     print(f"    Emails replaced:         {len(sanitizer.email_map)}")
+    print(f"    Interfaces replaced:     {len(sanitizer.iface_map)}")
 
 
 if __name__ == "__main__":
