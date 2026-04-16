@@ -698,6 +698,8 @@ class ConfigSanitizer:
 
         # --- nat entries (top-level and indented inside objects) ---
         if stripped.startswith('nat ') or stripped.startswith('nat('):
+            # Redact inline description before other processing
+            line = re.sub(r'(\s+description\s+).*', r'\1REDACTED_DESCRIPTION', line)
             line = self._sanitize_nat_ifaces(line)
             line = self.sanitize_ip_in_line(line)
             line = self._replace_object_refs(line)
