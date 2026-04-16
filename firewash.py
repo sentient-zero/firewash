@@ -332,6 +332,12 @@ class ConfigSanitizer:
             name = self._map_name(m.group(2), self.objgrp_map, "OBJGRP-", "objgrp_counter")
             return f"{m.group(1)}{name}{m.group(3)}\n"
 
+        # --- group-object references inside object-group blocks ---
+        m = re.match(r'^(\s*group-object\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.objgrp_map, "OBJGRP-", "objgrp_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
         # --- ACL names ---
         m = re.match(r'^(access-list\s+)(\S+)(\s+.*)', line)
         if m:
@@ -607,6 +613,31 @@ class ConfigSanitizer:
         if m:
             ip = self._get_replacement_ip(m.group(2))
             return f"{m.group(1)}{ip} REDACTED_COMMUNITY\n"
+
+        # --- snmp-server user (contains engineID, auth hash, priv hash) ---
+        m = re.match(r'^(snmp-server\s+user\s+)(\S+)(\s+)(\S+)(.*)', line)
+        if m:
+            username = self._map_name(m.group(2), self.user_map, "user", "user_counter")
+            group = m.group(4)
+            rest = m.group(5)
+            # Redact engineID
+            rest = re.sub(r'(engineID\s+)\S+', r'\1REDACTED_ENGINEID', rest)
+            # Redact auth hash (auth sha/md5 <hash>)
+            rest = re.sub(r'(auth\s+\S+\s+)\S+', r'\1REDACTED_AUTH_HASH', rest)
+            # Redact priv hash (priv aes/des <size>? <hash>)
+            rest = re.sub(r'(priv\s+\S+\s+(?:\d+\s+)?)\S+', r'\1REDACTED_PRIV_HASH', rest)
+            return f"{m.group(1)}{username}{m.group(3)}{group}{rest}\n"
+
+        # --- snmp-server group ---
+        m = re.match(r'^(snmp-server\s+group\s+)(\S+)(.*)', line)
+        if m:
+            rest = m.group(3)
+            return f"{m.group(1)}{m.group(2)}{rest}\n"
+
+        # --- snmp-server engineID (standalone) ---
+        m = re.match(r'^(snmp-server\s+engineID\s+\S+\s+)(\S+)(.*)', line)
+        if m:
+            return f"{m.group(1)}REDACTED_ENGINEID{m.group(3)}\n"
 
         # --- logging host ---
         m = re.match(r'^(logging\s+host\s+\S+\s+)(\S+)(.*)', line)
