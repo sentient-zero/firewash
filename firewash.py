@@ -108,7 +108,7 @@ class ConfigSanitizer:
             (re.compile(r'(key\s+)\S+(\s+encrypted)?', re.IGNORECASE), r'\1REDACTED_KEY\2'),
             (re.compile(r'(community\s+)\S+', re.IGNORECASE), r'\1REDACTED_COMMUNITY'),
             (re.compile(r'(snmp-server\s+host\s+\S+\s+)\S+', re.IGNORECASE), None),  # handled separately
-            (re.compile(r'(certificate\s+[0-9a-fA-F]+)'), r'certificate REDACTED_CERT_SERIAL'),
+            (re.compile(r'(certificate\s+)(?!chain\b)([0-9a-fA-F]{4,})'), r'\1REDACTED_CERT_SERIAL'),
             (re.compile(r'(^\s*[0-9a-f]{2}(?:\s+[0-9a-f]{2}){7,}\s*$)', re.MULTILINE), ' REDACTED_CERT_DATA'),
             (re.compile(r'(trustpoint\s+)\S+', re.IGNORECASE), None),  # mapped, not redacted
             (re.compile(r'(enable\s+password\s+)\S+(\s+.*)?'), r'\1REDACTED_PASS\2'),
@@ -425,11 +425,31 @@ class ConfigSanitizer:
             name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
             return f"{m.group(1)}{name}{m.group(3)}\n"
 
-        # trustpoint references in other contexts (e.g., "trustpoint <name>" inside tunnel-group)
+        # --- crypto ca certificate chain <trustpoint-name> ---
+        m = re.match(r'^(crypto\s+ca\s+certificate\s+chain\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # trustpoint references in other contexts (e.g., inside tunnel-group)
         m = re.match(r'^(\s*trustpoint\s+)(\S+)(.*)', line)
         if m:
             name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
             return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # broader trustpoint references mid-line (crypto ikev2 remote-access trustpoint, etc.)
+        m = re.match(r'^(.*\s+trustpoint\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
+            rest = self.sanitize_ip_in_line(m.group(3))
+            return f"{m.group(1)}{name}{rest}\n"
+
+        # crypto ikev1 trust-point variant
+        m = re.match(r'^(.*\s+trust-point\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
 
         # --- aaa-server definitions and references ---
         m = re.match(r'^(aaa-server\s+)(\S+)(\s+.*)', line)
