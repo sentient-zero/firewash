@@ -37,6 +37,13 @@ class ConfigSanitizer:
         self.community_counter = 0
         self.description_counter = 0
         self.generic_counter = 0
+        self.trustpoint_counter = 0
+        self.aaa_counter = 0
+        self.keypair_counter = 0
+        self.dns_srvgrp_counter = 0
+        self.ldap_attrmap_counter = 0
+        self.fqdn_counter = 0
+        self.email_counter = 0
 
         # Mapping dicts: original -> sanitized
         self.ip_map = OrderedDict()
@@ -51,6 +58,13 @@ class ConfigSanitizer:
         self.tunnel_map = OrderedDict()
         self.grouppolicy_map = OrderedDict()
         self.crypto_map_map = OrderedDict()
+        self.trustpoint_map = OrderedDict()
+        self.aaa_map = OrderedDict()
+        self.keypair_map = OrderedDict()
+        self.dns_srvgrp_map = OrderedDict()
+        self.ldap_attrmap_map = OrderedDict()
+        self.fqdn_map = OrderedDict()
+        self.email_map = OrderedDict()
 
         # RFC5737 documentation ranges for IP replacement
         # 192.0.2.0/24 (TEST-NET-1), 198.51.100.0/24 (TEST-NET-2), 203.0.113.0/24 (TEST-NET-3)
@@ -153,6 +167,66 @@ class ConfigSanitizer:
         mapping[original] = replacement
         return replacement
 
+    def _sanitize_dn(self, dn_string):
+        """Sanitize an X.500 / LDAP distinguished name, preserving RDN keys."""
+        # Matches RDN components like CN=value, OU=value, DC=value, O=value, etc.
+        def replace_rdn(m):
+            key = m.group(1).upper()
+            val = m.group(2)
+            if key == 'DC':
+                sanitized = self._map_name(val, self.domain_map, "sanitized-domain-", "domain_counter")
+                return f"{m.group(1)}={sanitized}"
+            elif key == 'CN':
+                sanitized = self._map_name(val, self.host_map, "HOST-", "host_counter")
+                return f"{m.group(1)}={sanitized}"
+            elif key == 'O':
+                return f"{m.group(1)}=SANITIZED-ORG"
+            elif key == 'OU':
+                return f"{m.group(1)}=SANITIZED-OU"
+            elif key in ('L', 'ST', 'C'):
+                return f"{m.group(1)}=SANITIZED-{key}"
+            elif key == 'E' or key == 'EMAILADDRESS':
+                sanitized = self._sanitize_email(val)
+                return f"{m.group(1)}={sanitized}"
+            else:
+                return f"{m.group(1)}=SANITIZED"
+        return re.sub(r'([A-Za-z]+)\s*=\s*([^,/]+)', replace_rdn, dn_string)
+
+    def _sanitize_fqdn(self, fqdn):
+        """Map an FQDN to a sanitized equivalent."""
+        if fqdn in self.fqdn_map:
+            return self.fqdn_map[fqdn]
+        replacement = f"host{self.fqdn_counter}.sanitized.local"
+        self.fqdn_map[fqdn] = replacement
+        self.fqdn_counter += 1
+        return replacement
+
+    def _sanitize_email(self, email):
+        """Map an email address to a sanitized equivalent."""
+        if email in self.email_map:
+            return self.email_map[email]
+        replacement = f"user{self.email_counter}@sanitized.local"
+        self.email_map[email] = replacement
+        self.email_counter += 1
+        return replacement
+
+    def _sanitize_url(self, url):
+        """Sanitize a URL by replacing the hostname/FQDN portion."""
+        m = re.match(r'^(https?://)([^/:]+)(.*)', url)
+        if m:
+            scheme = m.group(1)
+            host = m.group(2)
+            rest = m.group(3)
+            sanitized_host = self._sanitize_fqdn(host)
+            return f"{scheme}{sanitized_host}{rest}"
+        return url
+
+    def sanitize_emails_in_line(self, line):
+        """Replace email addresses in a line."""
+        def replace_email(m):
+            return self._sanitize_email(m.group(0))
+        return re.sub(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', replace_email, line)
+
     def sanitize_ip_in_line(self, line):
         """Replace all IPv4 addresses in a line."""
         # IPv4 with CIDR
@@ -241,8 +315,8 @@ class ConfigSanitizer:
             name = self._map_name(m.group(2), self.host_map, "FW-", "host_counter")
             return f"{m.group(1)}{name}\n"
 
-        # --- domain-name ---
-        m = re.match(r'^(domain-name\s+)(\S+)', line)
+        # --- domain-name (top-level and inside dns server-group) ---
+        m = re.match(r'^(\s*domain-name\s+)(\S+)', line)
         if m:
             name = self._map_name(m.group(2), self.domain_map, "sanitized-domain-", "domain_counter")
             return f"{m.group(1)}{name}.local\n"
@@ -340,6 +414,162 @@ class ConfigSanitizer:
             rest = self.sanitize_ip_in_line(m.group(3))
             return f"{m.group(1)}{name}{rest}\n"
 
+        # --- trustpoint definitions and references ---
+        m = re.match(r'^(crypto\s+ca\s+trustpoint\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        m = re.match(r'^(\s*ssl\s+trust-point\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # trustpoint references in other contexts (e.g., "trustpoint <name>" inside tunnel-group)
+        m = re.match(r'^(\s*trustpoint\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.trustpoint_map, "TP-", "trustpoint_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- aaa-server definitions and references ---
+        m = re.match(r'^(aaa-server\s+)(\S+)(\s+.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.aaa_map, "AAA-", "aaa_counter")
+            rest = self.sanitize_ip_in_line(m.group(3))
+            return f"{m.group(1)}{name}{rest}\n"
+
+        # aaa-server references in tunnel-group/group-policy attributes
+        m = re.match(r'^(\s*authentication-server-group\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.aaa_map, "AAA-", "aaa_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        m = re.match(r'^(\s*authorization-server-group\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.aaa_map, "AAA-", "aaa_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        m = re.match(r'^(\s*accounting-server-group\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.aaa_map, "AAA-", "aaa_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- default-domain value (inside group-policy attributes) ---
+        m = re.match(r'^(\s*default-domain\s+value\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.domain_map, "sanitized-domain-", "domain_counter")
+            return f"{m.group(1)}{name}.local{m.group(3)}\n"
+
+        # --- split-tunnel-network-list value (references ACL name) ---
+        m = re.match(r'^(\s*split-tunnel-network-list\s+value\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.acl_map, "ACL-", "acl_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- group-policy banner value ---
+        m = re.match(r'^(\s*banner\s+value\s+)(.*)', line)
+        if m:
+            return f"{m.group(1)}REDACTED_BANNER\n"
+
+        # --- subject-name (inside crypto ca trustpoint) ---
+        m = re.match(r'^(\s*subject-name\s+)(.*)', line)
+        if m:
+            sanitized_dn = self._sanitize_dn(m.group(2))
+            return f"{m.group(1)}{sanitized_dn}\n"
+
+        # --- ldap-base-dn ---
+        m = re.match(r'^(\s*ldap-base-dn\s+)(.*)', line)
+        if m:
+            sanitized_dn = self._sanitize_dn(m.group(2))
+            return f"{m.group(1)}{sanitized_dn}\n"
+
+        # --- ldap-login-dn ---
+        m = re.match(r'^(\s*ldap-login-dn\s+)(.*)', line)
+        if m:
+            sanitized_dn = self._sanitize_dn(m.group(2))
+            return f"{m.group(1)}{sanitized_dn}\n"
+
+        # --- ldap-login-password ---
+        m = re.match(r'^(\s*ldap-login-password\s+)(.*)', line)
+        if m:
+            return f"{m.group(1)}REDACTED_PASS\n"
+
+        # --- keypair names ---
+        m = re.match(r'^(\s*keypair\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.keypair_map, "KP-", "keypair_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- fqdn in object definitions ---
+        m = re.match(r'^(\s*fqdn\s+(?:v4\s+|v6\s+)?)(\S+)(.*)', line)
+        if m:
+            name = self._sanitize_fqdn(m.group(2))
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- group-alias (tunnel-group webvpn-attributes) ---
+        m = re.match(r'^(\s*group-alias\s+)(\S+)(\s+.*)', line)
+        if m:
+            orig = m.group(2)
+            # Map through tunnel_map if the alias matches a known tunnel-group name
+            if orig in self.tunnel_map:
+                name = self.tunnel_map[orig]
+            else:
+                name = self._map_name(orig, self.tunnel_map, "TG-", "tunnel_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- group-url (tunnel-group webvpn-attributes) ---
+        m = re.match(r'^(\s*group-url\s+)(\S+)(\s+.*)', line)
+        if m:
+            sanitized_url = self._sanitize_url(m.group(2))
+            return f"{m.group(1)}{sanitized_url}{m.group(3)}\n"
+
+        # --- dns server-group names ---
+        m = re.match(r'^(dns\s+server-group\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.dns_srvgrp_map, "DNSGRP-", "dns_srvgrp_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # dns server-group reference (e.g., "dns-server-group <name>" in group-policy)
+        m = re.match(r'^(\s*dns-server-group\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.dns_srvgrp_map, "DNSGRP-", "dns_srvgrp_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- ldap-attribute-map names ---
+        m = re.match(r'^(ldap-attribute-map\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.ldap_attrmap_map, "LDAPMAP-", "ldap_attrmap_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # ldap-attribute-map reference inside aaa-server host config
+        m = re.match(r'^(\s*ldap-attribute-map\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.ldap_attrmap_map, "LDAPMAP-", "ldap_attrmap_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- vpn-filter value (references ACL name) ---
+        m = re.match(r'^(\s*vpn-filter\s+value\s+)(\S+)(.*)', line)
+        if m:
+            name = self._map_name(m.group(2), self.acl_map, "ACL-", "acl_counter")
+            return f"{m.group(1)}{name}{m.group(3)}\n"
+
+        # --- smtp-server ---
+        m = re.match(r'^(smtp-server\s+)(\S+)(.*)', line)
+        if m:
+            rest = self.sanitize_ip_in_line(m.group(2))
+            return f"{m.group(1)}{rest}{m.group(3)}\n"
+
+        # --- call-home profile names ---
+        m = re.match(r'^(\s*profile\s+)(\S+)(.*)', line)
+        if m and 'call-home' in line.lower():
+            return f"{m.group(1)}SANITIZED-PROFILE{m.group(3)}\n"
+
+        # --- destination URLs in call-home ---
+        m = re.match(r'^(\s*destination\s+address\s+\S+\s+)(https?://\S+)(.*)', line)
+        if m:
+            sanitized_url = self._sanitize_url(m.group(2))
+            return f"{m.group(1)}{sanitized_url}{m.group(3)}\n"
+
         # --- description lines ---
         m = re.match(r'^(\s*description\s+)(.*)', line)
         if m:
@@ -384,6 +614,9 @@ class ConfigSanitizer:
 
         # --- Object/object-group references inside lines ---
         line = self._replace_object_refs(line)
+
+        # --- Catch-all email sanitization ---
+        line = self.sanitize_emails_in_line(line)
 
         # --- Catch-all IP sanitization for remaining lines ---
         line = self.sanitize_ip_in_line(line)
@@ -464,6 +697,20 @@ class ConfigSanitizer:
             report["address_pools"] = dict(self.pool_map)
         if self.crypto_map_map:
             report["crypto_maps"] = dict(self.crypto_map_map)
+        if self.trustpoint_map:
+            report["trustpoints"] = dict(self.trustpoint_map)
+        if self.aaa_map:
+            report["aaa_servers"] = dict(self.aaa_map)
+        if self.keypair_map:
+            report["keypairs"] = dict(self.keypair_map)
+        if self.dns_srvgrp_map:
+            report["dns_server_groups"] = dict(self.dns_srvgrp_map)
+        if self.ldap_attrmap_map:
+            report["ldap_attribute_maps"] = dict(self.ldap_attrmap_map)
+        if self.fqdn_map:
+            report["fqdns"] = dict(self.fqdn_map)
+        if self.email_map:
+            report["emails"] = dict(self.email_map)
         return report
 
 
@@ -512,6 +759,13 @@ def main():
     print(f"    Users replaced:          {len(sanitizer.user_map)}")
     print(f"    Address pools replaced:  {len(sanitizer.pool_map)}")
     print(f"    Crypto maps replaced:    {len(sanitizer.crypto_map_map)}")
+    print(f"    Trustpoints replaced:    {len(sanitizer.trustpoint_map)}")
+    print(f"    AAA servers replaced:    {len(sanitizer.aaa_map)}")
+    print(f"    Keypairs replaced:       {len(sanitizer.keypair_map)}")
+    print(f"    DNS server-groups:       {len(sanitizer.dns_srvgrp_map)}")
+    print(f"    LDAP attr maps:          {len(sanitizer.ldap_attrmap_map)}")
+    print(f"    FQDNs replaced:          {len(sanitizer.fqdn_map)}")
+    print(f"    Emails replaced:         {len(sanitizer.email_map)}")
 
 
 if __name__ == "__main__":
